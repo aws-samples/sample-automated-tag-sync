@@ -25,7 +25,7 @@ The solution monitors tag changes with a configurable prefix (default: `fw-`) an
 
 ## Architecture
 
-![Architecture Diagram](architecture-diagram.png)
+![Architecture Diagram](architecture_diagram.png)
 
 *Architecture Overview: The solution uses EventBridge to monitor tag changes on AWS resources, triggers a Lambda function to process the events, and automatically propagates tags to associated ENIs.*
 
