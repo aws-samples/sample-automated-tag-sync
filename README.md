@@ -116,4 +116,4 @@ When implementing tag-based firewall rules, strict control over tagging permissi
 
 ## Acknowledgments
 
-This project was built together with **[Michal Reznik](https://www.linkedin.com/in/michal-resnik/)** from **[AllCloud](https://allcloud.io/)**, who was instrumental in developing this automated tag propagation solution.
+This project was built together with **[Michal Resnik](https://www.linkedin.com/in/michal-resnik/)** from **[AllCloud](https://allcloud.io/)**, who was instrumental in developing this automated tag propagation solution.
