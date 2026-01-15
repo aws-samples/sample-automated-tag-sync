@@ -57,8 +57,8 @@ The solution monitors tag changes with a configurable prefix (default: `fw-`) an
 
 1. **Clone or download the template**
    ```bash
-   git clone <repository-url>
-   cd tag-event-capture
+   git clone https://github.com/aws-samples/sample-automated-tag-sync.git
+   cd sample-automated-tag-sync
    ```
 
 2. **Deploy the CloudFormation stack** (choose one option):
