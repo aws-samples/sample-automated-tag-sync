@@ -1,0 +1,493 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: tag propagation cloudformation template
+
+Parameters:
+  TagPrefix:
+    Type: String
+    Default: fw-
+    Description: Prefix for tags to monitor and propagate
+    AllowedPattern: '^[a-zA-Z0-9-_]+$'
+    ConstraintDescription: Tag prefix must contain only alphanumeric characters, hyphens, and underscores
+
+Resources:
+
+  TagPropagationDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  TagPropagationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: tag-actions-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: "*"
+                Effect: Allow
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+                    aws:requestedRegion: !Ref AWS::Region
+        - PolicyName: tag-propagation-base-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ecs:DescribeTasks
+                  - ecs:ListTagsForResource
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                  - ecs:ListTasks
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:ListTagsForResource
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListTags
+                  - workspaces:DescribeWorkspaces
+                  - workspaces:DescribeTags
+                  - fsx:DescribeFileSystems
+                  - sqs:SendMessage
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*"
+                  - !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:*"
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:*"
+                  - !Sub "arn:${AWS::Partition}:workspaces:${AWS::Region}:${AWS::AccountId}:*"
+                  - !Sub "arn:${AWS::Partition}:fsx:${AWS::Region}:${AWS::AccountId}:*"
+                  - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:*"
+
+                Effect: Allow
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TagPropagationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: TagPropagationRule
+      State: ENABLED
+      EventPattern:
+        detail-type:
+          - Tag Change on Resource
+        source:
+          - aws.tag
+          - aws.workspaces
+        detail:
+          changed-tag-keys:
+            - prefix: !Ref TagPrefix
+          service:
+            - rds
+            - fsx
+            - workspaces
+            - lambda
+            - ecs
+      Targets:
+        - Arn: !GetAtt TagPropagationLambda.Arn
+          Id: TargetFunctionV1
+          
+  TagPropagationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: lambda function to propagate resource tags to associated enis
+      MemorySize: 128
+      Timeout: 60
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          TAG_PREFIX: !Ref TagPrefix
+      PackageType: Zip
+      Role: !GetAtt TagPropagationServiceRole.Arn
+      ReservedConcurrentExecutions: 20
+      DeadLetterConfig:
+        TargetArn: !GetAtt TagPropagationDLQ.Arn
+
+      Code:
+        ZipFile: |
+          /**
+          * AWS Tag Synchronization Lambda
+          * Synchronizes resource tags to their associated network interfaces across multiple AWS services.
+          * Triggered by EventBridge events when resources are created/updated.
+          */
+
+          const { ECSClient, DescribeTasksCommand, ListTagsForResourceCommand, ListTasksCommand, TagResourceCommand, UntagResourceCommand } = require("@aws-sdk/client-ecs");
+          const { FSxClient, DescribeFileSystemsCommand } = require("@aws-sdk/client-fsx");
+          const { RDSClient, DescribeDBInstancesCommand, ListTagsForResourceCommand: ListTagsForRDS } = require("@aws-sdk/client-rds");
+          const { WorkSpacesClient, DescribeWorkspacesCommand, DescribeTagsCommand } = require("@aws-sdk/client-workspaces");
+          const { LambdaClient, ListTagsCommand, GetFunctionConfigurationCommand } = require("@aws-sdk/client-lambda");
+          const { EC2Client, DescribeNetworkInterfacesCommand, CreateTagsCommand, DeleteTagsCommand } = require("@aws-sdk/client-ec2");
+
+          const TAG_PREFIX = process.env.TAG_PREFIX || "fw-";
+          const SUPPORTED_TYPES = ["instance", "task", "service", "function", "db", "file-system", "workspace"];
+
+          // Pre-initialize EC2 client (always needed)
+          const ec2Client = new EC2Client({ region: process.env.AWS_REGION || 'il-central-1' });
+
+          // Client cache for event-dependent services
+          const clientCache = {};
+
+          //Returns cached AWS service client to optimize performance.
+          const getServiceClient = (serviceType, region = process.env.AWS_REGION || 'il-central-1') => {
+            const key = `${serviceType}-${region}`;
+            
+            if (!clientCache[key]) {
+              const clientMap = {
+                ecs: () => new ECSClient({ region }),
+                rds: () => new RDSClient({ region }),
+                fsx: () => new FSxClient({ region }),
+                lambda: () => new LambdaClient({ region }),
+                workspaces: () => new WorkSpacesClient({ region })
+              };
+              
+              clientCache[key] = clientMap[serviceType]?.();
+            }
+            
+            return clientCache[key];
+          };
+
+          /**
+          * Filters tags by configured prefix to identify relevant tags.
+          */
+          const filterTagsByPrefix = (tags, prefix = TAG_PREFIX) => 
+            tags.filter(tag => tag.Key?.startsWith(prefix) || tag.key?.startsWith(prefix));
+
+          /**
+          * Normalizes tag format across different AWS service responses.
+          */
+          const normalizeTags = (tags) => 
+            tags.map(tag => ({ Key: tag.Key || tag.key, Value: tag.Value || tag.value }));
+
+          // Service-specific handlers for extracting network interfaces and tags
+          const serviceHandlers = {
+            async lambda(resource, resourceIdentifier) {
+              const lambdaClient = getServiceClient('lambda');
+              const response = await lambdaClient.send(new GetFunctionConfigurationCommand({ FunctionName: resourceIdentifier }));
+
+              if (!response.VpcConfig?.SecurityGroupIds) {
+                return { statusCode: 200, body: "Lambda not in VPC" };
+              }
+
+              const tagResponse = await lambdaClient.send(new ListTagsCommand({ Resource: resource }));
+              const resourceTags = Object.entries(tagResponse.Tags || {})
+                .filter(([key]) => key.startsWith(TAG_PREFIX))
+                .map(([Key, Value]) => ({ Key, Value }));
+
+              const eniResponse = await ec2Client.send(new DescribeNetworkInterfacesCommand({
+                Filters: [
+                  { Name: 'vpc-id', Values: [response.VpcConfig.VpcId] },
+                  { Name: 'description', Values: [`AWS Lambda VPC ENI-*${resourceIdentifier}*`] }
+                ]
+              }));
+
+              if (eniResponse.NetworkInterfaces.length === 0) {
+                return { statusCode: 200, body: "No ENIs found" };
+              }
+
+              return {
+                networkInterfaces: eniResponse.NetworkInterfaces.map(eni => eni.NetworkInterfaceId),
+                resourceTags
+              };
+            },
+
+            async ecs(resource, resourceIdentifier, resourceType) {
+              const ecsCluster = resource.split(':')[5].split('/')[1];
+
+              if (resourceType === 'service') {
+                return await this.handleEcsService(resource, resourceIdentifier, ecsCluster);
+              } else if (resourceType === 'task') {
+                return await this.handleEcsTask(resource, resourceIdentifier, ecsCluster);
+              }
+            },
+
+            async handleEcsService(serviceArn, serviceName, cluster) {
+              const ecsClient = getServiceClient('ecs');
+              const serviceTagsResponse = await ecsClient.send(new ListTagsForResourceCommand({ resourceArn: serviceArn }));
+              const serviceTags = normalizeTags(filterTagsByPrefix(serviceTagsResponse.tags || []));
+
+              const listTasksResponse = await ecsClient.send(new ListTasksCommand({
+                cluster,
+                serviceName,
+                desiredStatus: 'RUNNING'
+              }));
+
+              if (listTasksResponse.taskArns.length === 0) {
+                return { statusCode: 200, body: "No running tasks found" };
+              }
+
+              // Synchronize service tags to all running tasks
+              await Promise.all(listTasksResponse.taskArns.map(async (taskArn) => {
+                try {
+                  const taskTagsResponse = await ecsClient.send(new ListTagsForResourceCommand({ resourceArn: taskArn }));
+                  const taskTags = normalizeTags(filterTagsByPrefix(taskTagsResponse.tags || []));
+
+                  const tagsToAdd = serviceTags.filter(serviceTag =>
+                    !taskTags.some(taskTag => taskTag.Key === serviceTag.Key && taskTag.Value === serviceTag.Value)
+                  );
+
+                  const tagsToDelete = taskTags.filter(taskTag =>
+                    !serviceTags.some(serviceTag => serviceTag.Key === taskTag.Key)
+                  );
+
+                  if (tagsToAdd.length > 0) {
+                    await ecsClient.send(new TagResourceCommand({
+                      resourceArn: taskArn,
+                      tags: tagsToAdd.map(t => ({ key: t.Key, value: t.Value }))
+                    }));
+                  }
+
+                  if (tagsToDelete.length > 0) {
+                    await ecsClient.send(new UntagResourceCommand({
+                      resourceArn: taskArn,
+                      tagKeys: tagsToDelete.map(t => t.Key)
+                    }));
+                  }
+                } catch (error) {
+                  console.error(`Failed to process task ${taskArn}:`, error);
+                }
+              }));
+
+              return { statusCode: 200, body: "ECS service tasks synchronized" };
+            },
+
+            async handleEcsTask(resource, resourceIdentifier, cluster) {
+              const ecsClient = getServiceClient('ecs');
+              const taskTagsResponse = await ecsClient.send(new ListTagsForResourceCommand({ resourceArn: resource }));
+              const resourceTags = normalizeTags(filterTagsByPrefix(taskTagsResponse.tags || []));
+
+              const describeTasksResponse = await ecsClient.send(new DescribeTasksCommand({ cluster, tasks: [resourceIdentifier] }));
+
+              const networkInterfaces = [];
+              const task = describeTasksResponse.tasks[0];
+              
+              // Extract ENI IDs from task attachments
+              if (task?.attachments) {
+                for (const attachment of task.attachments) {
+                  if (attachment.type === "ElasticNetworkInterface" && attachment.details) {
+                    for (const detail of attachment.details) {
+                      if (detail.name === "networkInterfaceId") {
+                        networkInterfaces.push(detail.value);
+                      }
+                    }
+                  }
+                }
+              }
+
+              if (networkInterfaces.length === 0) {
+                return { statusCode: 200, body: "No ENIs found for task" };
+              }
+
+              return { networkInterfaces, resourceTags };
+            },
+
+            async rds(resource, resourceIdentifier) {
+              const rdsClient = getServiceClient('rds');
+              const response = await rdsClient.send(new DescribeDBInstancesCommand({ DBInstanceIdentifier: resourceIdentifier }));
+              
+              if (!response.DBInstances?.length) {
+                return { statusCode: 404, body: "RDS instance not found" };
+              }
+
+              const rdsInstance = response.DBInstances[0];
+              const tagResponse = await rdsClient.send(new ListTagsForRDS({ ResourceName: rdsInstance.DBInstanceArn }));
+              const resourceTags = filterTagsByPrefix(tagResponse.TagList || []);
+
+              if (resourceTags.length === 0) {
+                return { statusCode: 200, body: "No relevant tags found" };
+              }
+
+              const securityGroupIds = rdsInstance.VpcSecurityGroups.map(sg => sg.VpcSecurityGroupId);
+              if (securityGroupIds.length === 0) {
+                return { statusCode: 200, body: "No security groups found" };
+              }
+
+              //finds RDS-associated ENIs through security group mapping.
+              const eniResponse = await ec2Client.send(new DescribeNetworkInterfacesCommand({
+                Filters: [
+                  { Name: 'group-id', Values: securityGroupIds },
+                  { Name: 'description', Values: ['RDSNetworkInterface*'] }
+                ]
+              }));
+
+              if (eniResponse.NetworkInterfaces.length === 0) {
+                return { statusCode: 200, body: "No ENIs found" };
+              }
+
+              return {
+                networkInterfaces: eniResponse.NetworkInterfaces.map(eni => eni.NetworkInterfaceId),
+                resourceTags
+              };
+            },
+
+            async fsx(resource, resourceIdentifier) {
+              const fsxClient = getServiceClient('fsx');
+              const response = await fsxClient.send(new DescribeFileSystemsCommand({ FileSystemId: resourceIdentifier }));
+              
+              if (!response.FileSystems?.length) {
+                return { statusCode: 404, body: "FSx file system not found" };
+              }
+
+              const fsxFileSystem = response.FileSystems[0];
+              return {
+                networkInterfaces: fsxFileSystem.NetworkInterfaceIds,
+                resourceTags: filterTagsByPrefix(fsxFileSystem.Tags || [])
+              };
+            },
+
+            async workspaces(resource, resourceIdentifier) {
+              const workspacesClient = getServiceClient('workspaces');
+              const response = await workspacesClient.send(new DescribeWorkspacesCommand({ WorkspaceIds: [resourceIdentifier] }));
+              
+              if (!response.Workspaces?.length) {
+                return { statusCode: 404, body: "Workspace not found" };
+              }
+
+              const workspace = response.Workspaces[0];
+              const tagResponse = await workspacesClient.send(new DescribeTagsCommand({ ResourceId: resourceIdentifier }));
+              const resourceTags = filterTagsByPrefix(tagResponse.TagList || []);
+
+              if (!workspace.IpAddress) {
+                return { statusCode: 200, body: "No IP address found" };
+              }
+
+              //finds WorkSpace ENI by matching private IP address
+              const eniResponse = await ec2Client.send(new DescribeNetworkInterfacesCommand({
+                Filters: [{ Name: 'addresses.private-ip-address', Values: [workspace.IpAddress] }]
+              }));
+
+              return {
+                networkInterfaces: eniResponse.NetworkInterfaces.map(eni => eni.NetworkInterfaceId),
+                resourceTags
+              };
+            }
+          };
+
+          /**
+          * Synchronizes resource tags to network interfaces by comparing existing tags
+          * and performing batch add/delete operations.
+          */
+          async function syncTags(networkInterfaces, resourceTags) {
+            if (networkInterfaces.length === 0) {
+              return { statusCode: 200, body: "No network interfaces found" };
+            }
+
+            // Batch fetch existing tags for all ENIs to minimize API calls
+            const existingTagsResponse = await ec2Client.send(new DescribeNetworkInterfacesCommand({
+              NetworkInterfaceIds: networkInterfaces
+            }));
+
+            const operations = [];
+            
+            for (const eni of existingTagsResponse.NetworkInterfaces) {
+              const existingTags = filterTagsByPrefix(eni.TagSet || []);
+              
+              const tagsToAdd = resourceTags.filter(resourceTag =>
+                !existingTags.some(existingTag => existingTag.Key === resourceTag.Key && existingTag.Value === resourceTag.Value)
+              );
+
+              const tagsToDelete = existingTags.filter(existingTag =>
+                !resourceTags.some(resourceTag => resourceTag.Key === existingTag.Key)
+              );
+
+              if (tagsToAdd.length > 0) {
+                operations.push(ec2Client.send(new CreateTagsCommand({
+                  Resources: [eni.NetworkInterfaceId],
+                  Tags: tagsToAdd
+                })));
+              }
+
+              if (tagsToDelete.length > 0) {
+                operations.push(ec2Client.send(new DeleteTagsCommand({
+                  Resources: [eni.NetworkInterfaceId],
+                  Tags: tagsToDelete.map(tag => ({ Key: tag.Key }))
+                })));
+              }
+            }
+
+            if (operations.length > 0) {
+              await Promise.all(operations);
+            }
+
+            return { statusCode: 200, body: "Tags synchronized successfully" };
+          }
+
+          /**
+          * Lambda handler for AWS resource tag synchronization.
+          * 
+          * Expected event structure: EventBridge event with detail.service and detail.resource-type
+          * Response format: { statusCode: number, body: string }
+          * 
+          * Flow: Parse event → Extract resource info → Call service handler → Sync tags to ENIs
+          */
+          exports.handler = async (event) => {
+            try {
+              console.log("Event:", JSON.stringify(event, null, 2));
+
+              if (!event?.detail || !event?.resources?.[0]) {
+                return { statusCode: 400, body: "Invalid event structure" };
+              }
+
+              const { detail, resources: [resource]} = event;
+              const { service, "resource-type": resourceType } = detail;
+
+              // Extract resource identifier based on service-specific ARN format
+              const resourceIdentifier = ['ecs', 'workspaces'].includes(service)
+                ? resource.split('/').pop()  // ECS & WorkSpaces: extract from path
+                : resource.split(':').pop(); // Others: extract from ARN
+
+              if (!service || !serviceHandlers[service] || !SUPPORTED_TYPES.includes(resourceType)) {
+                console.log(`Unsupported resource type: ${resourceType}`);
+                return { statusCode: 200, body: "Resource type not supported" };
+              }
+
+              console.log(`Processing ${resourceType} ${resourceIdentifier} for service ${service}`);
+
+              // Call appropriate service handler
+              const result = await serviceHandlers[service](resource, resourceIdentifier, resourceType);
+              
+              if (result.statusCode) {
+                return result;
+              }
+
+              // Sync tags to network interfaces
+              return await syncTags(result.networkInterfaces, result.resourceTags);
+              
+            } catch (error) {
+              console.error('Error processing request:', error);
+              return {
+                statusCode: 500,
+                body: `Internal server error: ${error.message}`
+              };
+            }
+          };
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TagPropagationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TagPropagationRule.Arn
+
+Outputs:
+  TagPropagationRuleArn:
+    Description: ARN of the CloudWatch Events rule created by this CloudFormation stack
+    Value: !GetAtt TagPropagationRule.Arn
